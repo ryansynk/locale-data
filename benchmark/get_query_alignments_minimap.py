@@ -193,9 +193,7 @@ def main(
         if not (best_dir / f"{sam.stem}.parquet").exists()
     ]
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [
-            executor.submit(get_best_alignments, sam, pq) for sam, pq in todo
-        ]
+        futures = [executor.submit(get_best_alignments, sam, pq) for sam, pq in todo]
         for f in tqdm(
             as_completed(futures), total=len(futures), desc="Extracting best alignments"
         ):

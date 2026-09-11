@@ -1,5 +1,6 @@
 import random
 import subprocess
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -8,29 +9,37 @@ from jsonargparse import auto_cli
 from tqdm import tqdm
 
 
-def stream_reads(srr_id: str, topdir: Path, num_reads: int):
+def stream_reads(srr_id: str, topdir: Path, num_reads: int, max_attempts: int = 4):
     """Stream the first num_reads spots of an SRA run with fastq-dump.
 
     fastq-dump -X streams over HTTPS and stops after num_reads spots, so the
-    full run is never downloaded.
+    full run is never downloaded. NCBI's resolver service fails transiently
+    ("Failed to call external services"), so retry with backoff. Accessions
+    that already have a fastq on disk are skipped, making reruns resumable.
     """
     target_dir = Path(topdir) / srr_id
     target_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        subprocess.run(
-            ["fastq-dump", "-X", str(num_reads), "--split-files", srr_id],
-            cwd=target_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr if e.stderr else str(e)
-        print(f"Command failed: {error_msg}")
-        raise
-    except FileNotFoundError:
-        print("SRA Toolkit not found. Is fastq-dump in your PATH?")
-        raise
+    if any(target_dir.glob("*.fastq")):
+        return
+    for attempt in range(1, max_attempts + 1):
+        try:
+            subprocess.run(
+                ["fastq-dump", "-X", str(num_reads), "--split-files", srr_id],
+                cwd=target_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr if e.stderr else str(e)
+            print(f"{srr_id} attempt {attempt}/{max_attempts} failed: {error_msg}")
+            if attempt == max_attempts:
+                raise
+            time.sleep(min(10 * 2 ** (attempt - 1), 60))
+        except FileNotFoundError:
+            print("SRA Toolkit not found. Is fastq-dump in your PATH?")
+            raise
 
 
 def get_fastq_file(srr_dir: Path) -> Path:

@@ -21,49 +21,47 @@ def write_output_fasta(queries_df: pl.DataFrame, output_fasta: Path):
     SeqIO.write(records, output_fasta, "fasta")
 
 
-def has_overlap(intervals, chunk_size, mode):
-    """Helper function for filtering out queries that align to similar regions on the same contig.
+def overlapping_query_ids(
+    queries_df: pl.DataFrame, chunk_size: int, mode: str
+) -> pl.DataFrame:
+    """Find queries that align to similar regions on the same contig.
 
-    Given a list of alignment intervals on a contig, determines whether any pair
-    of intervals are close enough to be considered overlapping, based on the
-    filtering mode.
+    A contig is flagged when any two of its alignment intervals (sorted by
+    start) are close enough to be considered overlapping:
+      - "strict": the gap between consecutive intervals is < chunk_size,
+        assuming worst-case chunk placement.
+      - "lenient": intervals directly overlap (negative gap).
+    Every query with an alignment on a flagged contig is returned.
 
-    Args:
-        intervals: List of structs with two int fields representing
-            alignment start and end positions on a contig.
-        chunk_size: The size of the chunk window used for the strict
-            overlap check. Default is 1024.
-        mode: Filtering stringency for overlap detection.
-            - "strict": Flags overlap if the gap between any two intervals
-              is less than chunk_size, assuming worst-case chunk placement.
-            - "lenient": Flags overlap only when intervals directly overlap.
-            - "none": No overlap filtering; always returns False.
-
-    Returns:
-        bool: True if any intervals are considered overlapping under the
-        given mode, False otherwise.
+    Only the columns needed for the check are exploded: exploding the full
+    frame would duplicate the query sequence and every other list column per
+    alignment row, which does not fit in memory at this scale.
     """
-    if len(intervals) <= 1:
-        return False
-
-    sorted_ivs = sorted(
-        (iv["aln_start_index_contig"], iv["aln_end_index_contig"]) for iv in intervals
+    intervals = (
+        queries_df.lazy()
+        .select("query_id", "contig_id", "aln_interval_contig")
+        .explode("contig_id", "aln_interval_contig")
+        .unnest("aln_interval_contig")
+        .sort("contig_id", "aln_start_index_contig", "aln_end_index_contig")
     )
-
-    for i in range(1, len(sorted_ivs)):
-        gap = sorted_ivs[i][0] - sorted_ivs[i - 1][1]
-
-        if mode == "strict":
-            # Worst case chunk placement — any gap < chunk_size is suspect
-            if gap < chunk_size:
-                return True
-        elif mode == "lenient":
-            # Only flag direct overlap
-            if gap < 0:
-                return True
-        # mode == "none" — no overlap check, always False
-
-    return False
+    gap_threshold = chunk_size if mode == "strict" else 0
+    flagged_contigs = (
+        intervals.with_columns(
+            (
+                pl.col("aln_start_index_contig")
+                - pl.col("aln_end_index_contig").shift(1).over("contig_id")
+            ).alias("gap")
+        )
+        .filter(pl.col("gap") < gap_threshold)
+        .select("contig_id")
+        .unique()
+    )
+    return (
+        intervals.join(flagged_contigs, on="contig_id")
+        .select("query_id")
+        .unique()
+        .collect()
+    )
 
 
 def main(
@@ -84,7 +82,6 @@ def main(
     accs.txt — the exact layout the benchmark consumes.
     """
     minimap_stats: Path = Path(minimap_stats)
-    stats_df = pl.read_parquet(minimap_stats)
     queries_fa: Path = Path(queries_fa)
     accessions_file: Path = Path(accessions_file)
     accessions = accessions_file.read_text().splitlines()
@@ -99,68 +96,52 @@ def main(
                 "query_sequence": str(record.seq),
             }
         )
-
     queries_df = pl.from_dicts(queries_rows)
-    stats_df = stats_df.join(
-        queries_df.select(
-            [
-                pl.col("read_id"),
-                pl.col("query_sequence").str.len_chars().alias("read_length"),
-            ]
-        ),
-        on="read_id",
-    )
-    stats_df = stats_df.with_columns(
-        (pl.col("matches") / pl.col("read_length")).alias("identity")
-    )
-    stats_df = stats_df.with_columns(
-        (pl.col("target_len") / pl.col("read_length")).alias("ratio")
-    )
-    stats_df = stats_df.filter(pl.col("identity") > identity_filter)
-    stats_df = stats_df.with_columns(
-        pl.struct("aln_start_index_contig", "aln_end_index_contig").alias(
-            "aln_interval_contig"
-        )
-    )
-    stats_df = stats_df.group_by("read_id").agg(
-        [
-            "contig_id",
-            "accession",
-            "identity",
-            "ratio",
-            "target_len",
-            "aln_interval_contig",
-        ]
-    )
+
+    read_lengths = queries_df.select(
+        pl.col("read_id"),
+        pl.col("query_sequence").str.len_chars().alias("read_length"),
+    ).lazy()
+
+    # Lazy pipeline over the (very large) stats parquet: only needed columns
+    # are read, and filters run before anything is fully materialized
     max_matches = math.ceil(num_indexed_accessions * max_match_percent)
-    stats_df = stats_df.filter(pl.col("accession").list.len() <= max_matches)
-    stats_df = stats_df.rename(
-        {"accession": "contig_accession", "target_len": "contig_len"}
+    stats_df = (
+        pl.scan_parquet(minimap_stats)
+        .join(read_lengths, on="read_id")
+        .with_columns(
+            (pl.col("matches") / pl.col("read_length")).alias("identity"),
+            (pl.col("target_len") / pl.col("read_length")).alias("ratio"),
+        )
+        .filter(pl.col("identity") > identity_filter)
+        .with_columns(
+            pl.struct("aln_start_index_contig", "aln_end_index_contig").alias(
+                "aln_interval_contig"
+            )
+        )
+        .group_by("read_id")
+        .agg(
+            [
+                "contig_id",
+                "accession",
+                "identity",
+                "ratio",
+                "target_len",
+                "aln_interval_contig",
+            ]
+        )
+        .filter(pl.col("accession").list.len() <= max_matches)
+        .rename({"accession": "contig_accession", "target_len": "contig_len"})
+        .collect()
     )
     queries_df = queries_df.join(stats_df, on="read_id")
     queries_df = queries_df.rename({"read_id": "query_id"})
 
     if filter_mode != "none":
-        overlapping_queries = (
-            queries_df.explode("contig_id", "aln_interval_contig")
-            .group_by("contig_id")
-            .agg(pl.col("query_id"), pl.col("aln_interval_contig"))
-            .with_columns(
-                pl.col("aln_interval_contig")
-                .map_elements(
-                    lambda intervals: has_overlap(
-                        intervals, chunk_size=chunk_size, mode=filter_mode
-                    ),
-                    return_dtype=pl.Boolean,
-                )
-                .alias("has_overlap")
-            )
-            .filter(pl.col("has_overlap"))
-            .explode("query_id")["query_id"]
-            .unique()
-            .to_list()
+        overlapping = overlapping_query_ids(
+            queries_df, chunk_size=chunk_size, mode=filter_mode
         )
-        queries_df = queries_df.filter(~pl.col("query_id").is_in(overlapping_queries))
+        queries_df = queries_df.join(overlapping, on="query_id", how="anti")
 
     # Filter queries not aligned to their original accession
     queries_df = queries_df.filter(
@@ -186,6 +167,7 @@ def main(
     queries_df.write_parquet(output_path / "queries.parquet")
     write_output_fasta(queries_df, output_path / "queries.fa")
     shutil.copy(accessions_file, output_path / "accs.txt")
+    print(f"Wrote {len(queries_df)} queries to {output_path}")
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@ from pathlib import Path
 
 import polars as pl
 from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 from jsonargparse import auto_cli
 from jsonargparse.typing import Path_drw
 
@@ -64,6 +66,15 @@ def run_mutation_simulator(
     return mutated_fa
 
 
+def write_fasta(queries: pl.DataFrame, fasta: Path):
+    """queries.fa as finalize_query_dataset.py writes it (id = query_id)."""
+    records = (
+        SeqRecord(Seq(seq), id=query_id, description="")
+        for query_id, seq in queries.select("query_id", "query_sequence").iter_rows()
+    )
+    SeqIO.write(records, fasta, "fasta")
+
+
 def read_sequences(fasta: Path) -> pl.DataFrame:
     ids, seqs = [], []
     for record in SeqIO.parse(fasta, "fasta"):
@@ -95,7 +106,8 @@ def main(
 ):
     """
     Args:
-        bundle: dataset directory holding queries.parquet and queries.fa.
+        bundle: dataset directory holding queries.parquet (and queries.fa,
+            which is written from the parquet when absent).
         rates: SNP rates; one queries_mut<rate>.parquet is written per rate.
         indel_fraction: insertion and deletion rates are each this fraction
             of the SNP rate.
@@ -103,6 +115,9 @@ def main(
     bundle = Path(bundle)
     queries = pl.read_parquet(bundle / "queries.parquet")
     queries_fa = bundle / "queries.fa"
+    if not queries_fa.exists():
+        # Bundles pulled from Hugging Face carry only the parquet.
+        write_fasta(queries, queries_fa)
     mutations_dir = bundle / "mutations"
     mutations_dir.mkdir(exist_ok=True)
 

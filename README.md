@@ -96,6 +96,10 @@ uv run python benchmark/build_viral_bundle.py \
 
 The bundle has the standard layout and schema (`identity`, `ratio`, `contig_len`, `aln_interval_contig` and `strand` are null; `contig_id` holds the relevant accession), so `run_benchmark.py` runs on it unchanged. `accessions/sra55viral.txt` is its frozen index list (sra50 + genotype B).
 
+### Publishing a bundle
+
+`benchmark/upload_bundle.py --bundle constructed/<set>/bundle --repo_id rsynk/locale-benchmark-<set> --card cards/<set>.md` uploads every file in the bundle as-is, plus the card as `README.md`, in one commit (`--dry_run=true` lists the files first). The dataset cards live in `cards/`.
+
 ## Training pipeline
 
 The locale trainer (`data_type: contig`) consumes one parquet per split with a `sequence` column; cropping, mutation, and length filtering all happen at train time in the Batcher/Augmenter. Building a dataset is therefore just: download contigs, chunk, shuffle, write parquet.

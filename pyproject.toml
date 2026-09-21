@@ -5,6 +5,7 @@ description = "Benchmark and training dataset pipelines for the locale genomic e
 requires-python = ">=3.10"
 dependencies = [
     "biopython",
+    "huggingface-hub>=1.32.0",
     "jsonargparse",
     "mutation-simulator>=3.0.2",
     "numpy",

@@ -9,8 +9,16 @@ from tqdm import tqdm
 
 
 def download_logan(srr_id: str, topdir: Path) -> bool:
-    """Download one accession's contigs. Returns False if it's not in logan."""
+    """Download one accession's contigs. Returns False if it's not in logan.
+
+    An accession whose decompressed contigs.fa is already present is skipped,
+    so reruns (and work dirs seeded with contigs from an earlier build) only
+    fetch what is missing.
+    """
     target_dir = Path(topdir) / srr_id
+    fa_path = target_dir / f"{srr_id}.contigs.fa"
+    if fa_path.exists() and fa_path.stat().st_size > 0:
+        return True
     target_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         "aws",

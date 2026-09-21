@@ -7,9 +7,10 @@ dataset_queries/   SQL against SRA metadata (BigQuery) + subsample script → ca
 accessions/        frozen accession lists (the exact lists behind the published HF datasets)
 benchmark/         candidate list → benchmark bundle (queries.parquet, queries_mut<rate>.parquet, queries.fa, accs.txt)
 training/          candidate list → training parquet (all_contigs.parquet)
+constructed/       work dirs and bundles, `constructed/<set>/{work,bundle}` (gitignored)
 ```
 
-Both pipelines start from a **candidate accession list** (one accession per line) and share the same first step: `benchmark/download_logan_contigs.py` certifies the candidates against what actually exists in logan and emits the **true list** (`downloaded_accs.txt`), which is what flows through everything downstream.
+Both pipelines start from an **accession list** (one accession per line). Deciding what is in the list (organism proportions, size filters, existence in logan, exclusion of training accessions) happens entirely in the selection step; the build steps only read the list. `benchmark/download_logan_contigs.py` also emits the list it actually downloaded (`downloaded_accs.txt`) for training draws where a few candidates may be missing from logan.
 
 ## Dependencies
 
@@ -28,38 +29,40 @@ Candidate lists come from `dataset_queries/paired_illumina_ont.sql` run against 
 uv run python dataset_queries/subsample_accessions.py \
     accessions/TableS12_SRA_Public_100studies.tsv \
     /path/to/logan-seqstats-contigs-v1.1.parquet \
-    500 candidates.txt \
+    500 accessions/sra500.txt --seed=500 \
+    --exclude_files="[accessions/train.txt,accessions/val.txt]" \
     --max_nbseq=2000000 --min_bp=1000000
 ```
 
-Keep train, val, and benchmark lists disjoint (in SQL, or via `--exclude_files=[...]`). The lists in `accessions/` are frozen: they are the exact draws behind the published datasets.
+Keep train, val, and benchmark lists disjoint (in SQL, or via `--exclude_files=[...]`, which removes those accessions from the pool before the draw). The draw is deterministic in `--seed`, and each candidate is checked against logan-pub as it is drawn so the list has exactly N accessions (`--verify_logan=false` to skip for large training draws). The lists in `accessions/` are frozen: they are the exact draws behind the published datasets.
 
 ## Benchmark pipeline
 
-Produces a bundle in the layout of the Hugging Face benchmark datasets, ready to upload as-is.
+Produces a bundle in the layout of the Hugging Face benchmark datasets, ready to upload as-is. `benchmark/build_sra_bundle.sh <set> <N> <seed>` runs the draw above and the steps below under `constructed/<set>/` (it numbers the draw as step 1, so `from_step`/`to_step` are offset by one from the list below); `benchmark/align.sbatch` runs the alignment onwards on a compute node.
 
 ```bash
-WORK=/path/to/workdir
+ACCS=accessions/<set>.txt
+WORK=constructed/<set>/work
 
-# 1. Download logan contigs; emits the true accession list.
-#    Missing accessions are reported, not fatal (--strict=true to change that).
-uv run python benchmark/download_logan_contigs.py candidates.txt $WORK/logan_contigs
-ACCS=$WORK/logan_contigs/downloaded_accs.txt
+# 1. Download logan contigs. --strict: the list was checked at draw time,
+#    so a missing accession is a real error.
+uv run python benchmark/download_logan_contigs.py $ACCS $WORK/logan_contigs --strict=true
 
 # 2. Stream the first N raw reads per accession from SRA (no full download)
 #    and build the initial query fasta.
-uv run python benchmark/sample_raw_read_queries.py $ACCS $WORK/raw_reads $WORK/queries.fa --num_reads=1000
+uv run python benchmark/sample_raw_read_queries.py $ACCS $WORK/raw_reads $WORK/queries.fa --num_reads=1000 --seed=$SEED
 
-# 3. Align every query against every accession's contigs.
+# 3. Align every query against every accession's contigs, on both strands.
 #    Writes $WORK/alignments/<acc>.sam and $WORK/queries_alignment_stats.parquet
 #    (parquet is named after the query fasta's stem). Expensive — use a compute node.
 uv run python benchmark/get_query_alignments_minimap.py $WORK/queries.fa $WORK/logan_contigs $WORK --num_workers=32
 
-# 4. Filter alignments (identity > 0.9, overlap and max-match filters) and
-#    sample the final queries into a self-contained bundle.
+# 4. Filter alignments (identity > 0.9; then per query: source accession must
+#    be in the relevant set, max-match, overlap) and sample the final queries
+#    (seeded) into a self-contained bundle.
 uv run python benchmark/finalize_query_dataset.py \
     $WORK/queries.fa $WORK/queries_alignment_stats.parquet $ACCS $WORK/bundle \
-    --final_query_num=500
+    --final_query_num=500 --seed=$SEED
 
 # 5. Write one pre-mutated query file per mutation rate (0.00 / 0.05 / 0.10)
 #    with mutation-simulator: SNP rate = rate, insertion and deletion rates =
@@ -70,7 +73,7 @@ uv run python benchmark/mutate_queries.py --bundle $WORK/bundle
 
 `$WORK/bundle/` then contains:
 
-- `queries.parquet` — the clean queries with their alignment ground truth; what `print_results.py` and `make_table3.py` read.
+- `queries.parquet` — the clean queries with their alignment ground truth; what `print_results.py` and `make_table3.py` read. `query_sequence` is the raw read as sequenced (never reverse-complemented); `strand` (`+`/`-`) is the strand of the best hit to the source accession and is the only column added to the published schema.
 - `queries_mut0.00.parquet`, `queries_mut0.05.parquet`, `queries_mut0.10.parquet` — `queries.parquet` with `query_sequence` replaced by the mutated read and a `mutation_rate` column added. Same rows in the same order, so the benchmark's seeded subsample picks the same queries at every rate. `run_benchmark.py --mutation_rate <rate>` loads `queries_mut<rate>.parquet`.
 - `queries.fa` — the clean queries as fasta (mutation-simulator's input).
 - `mutations/` — mutation-simulator's fasta and VCF per rate. mutation-simulator has no seed flag, so these are the provenance record: rerunning step 5 draws different mutations, and the parquets are what the benchmark reads.
@@ -83,7 +86,8 @@ Pass `--rates=[0.0,0.02]` or `--indel_fraction=0.0` to step 5 to change the rate
 The locale trainer (`data_type: contig`) consumes one parquet per split with a `sequence` column; cropping, mutation, and length filtering all happen at train time in the Batcher/Augmenter. Building a dataset is therefore just: download contigs, chunk, shuffle, write parquet.
 
 ```bash
-# 1. Certify against logan and download (same script as the benchmark pipeline)
+# 1. Download (same script as the benchmark pipeline); missing accessions are
+#    reported, not fatal, and downloaded_accs.txt is the list actually built
 uv run python benchmark/download_logan_contigs.py train_candidates.txt $WORK/train/logan_contigs
 uv run python benchmark/download_logan_contigs.py val_candidates.txt $WORK/val/logan_contigs
 

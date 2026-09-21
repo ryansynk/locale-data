@@ -74,18 +74,39 @@ def main(
     identity_filter: float = 0.9,
     max_match_percent: float = 0.2,
     final_query_num: int = 500,
+    seed: int = 0,
 ):
     """Filter query alignments into a final benchmark dataset bundle.
 
     Writes a self-contained dataset directory at output_path containing
     queries.parquet, queries.fa, and a copy of the indexed accession list as
     accs.txt — the exact layout the benchmark consumes.
+
+    Alignments with identity (exact matches / read length) <= identity_filter
+    are dropped first. Then, per query, in this order:
+      1. drop it if no surviving alignment is to the accession it was sampled
+         from (its source must be in its relevant set);
+      2. drop it if it aligns to more than ceil(max_match_percent * number of
+         indexed accessions) accessions;
+      3. drop it if it overlaps another query (filter_mode, see
+         overlapping_query_ids).
+    The survivors are shuffled with `seed` and the first final_query_num kept,
+    so the same inputs and seed reproduce queries.parquet exactly.
+
+    The stored query is the raw read; alignment ran on both strands and the
+    `strand` column is the strand of the best hit to the source accession.
     """
     minimap_stats: Path = Path(minimap_stats)
     queries_fa: Path = Path(queries_fa)
     accessions_file: Path = Path(accessions_file)
-    accessions = accessions_file.read_text().splitlines()
+    accessions = accessions_file.read_text().split()
+    assert len(accessions) == len(set(accessions)), "duplicate accessions in list"
     num_indexed_accessions = len(accessions)
+    if "strand" not in pl.scan_parquet(minimap_stats).collect_schema():
+        raise SystemExit(
+            f"{minimap_stats} has no `strand` column: it was produced with the "
+            "forward-only aligner. Re-run get_query_alignments_minimap.py."
+        )
 
     queries_rows = []
     for record in SeqIO.parse(queries_fa, "fasta"):
@@ -96,30 +117,37 @@ def main(
                 "query_sequence": str(record.seq),
             }
         )
-    queries_df = pl.from_dicts(queries_rows)
+    queries_df = pl.from_dicts(
+        queries_rows,
+        schema={"accession": pl.Utf8, "read_id": pl.Utf8, "query_sequence": pl.Utf8},
+    )
+    initial = len(queries_df)
 
-    read_lengths = queries_df.select(
+    read_info = queries_df.select(
         pl.col("read_id"),
+        pl.col("accession").alias("source_accession"),
         pl.col("query_sequence").str.len_chars().alias("read_length"),
     ).lazy()
 
     # Lazy pipeline over the (very large) stats parquet: only needed columns
-    # are read, and filters run before anything is fully materialized
-    max_matches = math.ceil(num_indexed_accessions * max_match_percent)
+    # are read, and filters run before anything is fully materialized. Rows
+    # are sorted so the per-query lists come out in a fixed order.
+    is_source = pl.col("accession") == pl.col("source_accession")
     stats_df = (
         pl.scan_parquet(minimap_stats)
-        .join(read_lengths, on="read_id")
+        .join(read_info, on="read_id")
         .with_columns(
             (pl.col("matches") / pl.col("read_length")).alias("identity"),
             (pl.col("target_len") / pl.col("read_length")).alias("ratio"),
         )
         .filter(pl.col("identity") > identity_filter)
+        .sort("read_id", "accession", "contig_id", "aln_start_index_contig")
         .with_columns(
             pl.struct("aln_start_index_contig", "aln_end_index_contig").alias(
                 "aln_interval_contig"
             )
         )
-        .group_by("read_id")
+        .group_by("read_id", maintain_order=True)
         .agg(
             [
                 "contig_id",
@@ -128,29 +156,41 @@ def main(
                 "ratio",
                 "target_len",
                 "aln_interval_contig",
+                pl.col("strand").filter(is_source).first().alias("strand"),
             ]
         )
-        .filter(pl.col("accession").list.len() <= max_matches)
         .rename({"accession": "contig_accession", "target_len": "contig_len"})
         .collect()
     )
     queries_df = queries_df.join(stats_df, on="read_id")
     queries_df = queries_df.rename({"read_id": "query_id"})
 
+    # 1. The source accession must be in the relevant set
+    queries_df = queries_df.filter(
+        pl.col("contig_accession").list.contains(pl.col("accession"))
+    )
+    n_with_source = len(queries_df)
+    # 2. Max-match
+    max_matches = math.ceil(num_indexed_accessions * max_match_percent)
+    queries_df = queries_df.filter(
+        pl.col("contig_accession").list.len() <= max_matches
+    )
+    n_within_max = len(queries_df)
+    # 3. Overlap
     if filter_mode != "none":
         overlapping = overlapping_query_ids(
             queries_df, chunk_size=chunk_size, mode=filter_mode
         )
         queries_df = queries_df.join(overlapping, on="query_id", how="anti")
+    eligible = len(queries_df)
 
-    # Filter queries not aligned to their original accession
-    queries_df = queries_df.filter(
-        ~pl.col("contig_accession").list.contains(pl.col("accession"))
+    assert final_query_num <= eligible, (
+        f"Requested {final_query_num} queries, only {eligible} after filtering"
     )
-    assert final_query_num <= len(queries_df), (
-        f"Requested {final_query_num} queries, only {len(queries_df)} after filtering"
+    queries_df = queries_df.sort("query_id").sample(
+        final_query_num, shuffle=True, seed=seed
     )
-    queries_df = queries_df.sample(final_query_num, shuffle=True)
+    assert queries_df["strand"].null_count() == 0
 
     # Every accession the final queries reference must come from the indexed set
     acc_set = set(accessions)
@@ -167,7 +207,14 @@ def main(
     queries_df.write_parquet(output_path / "queries.parquet")
     write_output_fasta(queries_df, output_path / "queries.fa")
     shutil.copy(accessions_file, output_path / "accs.txt")
-    print(f"Wrote {len(queries_df)} queries to {output_path}")
+    n_minus = (queries_df["strand"] == "-").sum()
+    print(
+        f"Wrote {len(queries_df)} queries to {output_path}: {initial} initial, "
+        f"-{initial - n_with_source} no source hit, "
+        f"-{n_with_source - n_within_max} max-match (>{max_matches}), "
+        f"-{n_within_max - eligible} overlap, {eligible} eligible; "
+        f"{n_minus}/{len(queries_df)} on the - strand"
+    )
 
 
 if __name__ == "__main__":

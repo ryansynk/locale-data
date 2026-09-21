@@ -24,6 +24,7 @@ BEST_ALN_SCHEMA = {
     "target_len": pl.Int64,
     "aln_start_index_contig": pl.Int64,
     "aln_end_index_contig": pl.Int64,
+    "strand": pl.Utf8,
 }
 
 
@@ -36,12 +37,12 @@ def run_minimap(queries_fa: str, contig_fa: str, output_sam: str):
     # -t 1: parallelism comes from one process per contig file; -K 200M caps
     # the in-flight query batch so hundreds of workers fit in node memory.
     # --sam-hit-only: unmapped records are skipped downstream anyway and
-    # would add ~1GB per SAM.
+    # would add ~1GB per SAM. Both strands are aligned; the SAM flag records
+    # which one won.
     cmd = [
         "minimap2",
         "-a",
         "--eqx",
-        "--for-only",
         "--sam-hit-only",
         "-t",
         "1",
@@ -116,6 +117,7 @@ def get_best_alignments(input_sam: Path, output_parquet: Path):
                     "target_len": None,
                     "aln_start_index_contig": aln_start,
                     "aln_end_index_contig": aln_end,
+                    "strand": "-" if flag & 0x10 else "+",
                 }
 
     # Second pass over just the header for the lengths of winning contigs
@@ -151,7 +153,7 @@ def main(
     queries_fa: Path_fr,
     logan_path: Path_drw,
     output_path: Path_dc,
-    num_workers: int,
+    num_workers: int = 16,
     chunk_size: int = 10_000,
 ):
     logan_path: Path = Path(logan_path).resolve()

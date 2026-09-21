@@ -66,7 +66,9 @@ def main(
     output_dir, then samples queries_per_accession reads from each (all streamed
     reads when unset) and writes them to a single query fasta. Read ids keep the
     fastq-dump format (<accession>.<spot>), which downstream scripts rely on to
-    recover the source accession.
+    recover the source accession. Only the listed accessions are sampled
+    (output_dir may hold runs from earlier sets), in sorted order, so the
+    fasta is a function of the list, num_reads, and seed.
     """
     accessions_list: Path = Path(accessions_list).resolve()
     output_dir: Path = Path(output_dir).resolve()
@@ -92,9 +94,8 @@ def main(
 
     rng = random.Random(seed)
     records = []
-    acc_dirs = sorted(x for x in output_dir.iterdir() if x.is_dir())
-    for acc_dir in tqdm(acc_dirs, desc="Sampling queries..."):
-        acc_records = list(SeqIO.parse(get_fastq_file(acc_dir), "fastq"))
+    for acc in tqdm(sorted(set(accs)), desc="Sampling queries..."):
+        acc_records = list(SeqIO.parse(get_fastq_file(output_dir / acc), "fastq"))
         if queries_per_accession is not None and queries_per_accession < len(
             acc_records
         ):

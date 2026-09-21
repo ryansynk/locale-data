@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "biopython",
     "jsonargparse",
+    "mutation-simulator>=3.0.2",
     "numpy",
     "polars",
     "pysam",

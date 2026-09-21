@@ -5,7 +5,7 @@ Scripts for generating the training and benchmark datasets for the locale encode
 ```
 dataset_queries/   SQL against SRA metadata (BigQuery) + subsample script → candidate accession lists
 accessions/        frozen accession lists (the exact lists behind the published HF datasets)
-benchmark/         candidate list → benchmark bundle (queries.parquet, queries.fa, accs.txt)
+benchmark/         candidate list → benchmark bundle (queries.parquet, queries_mut<rate>.parquet, queries.fa, accs.txt)
 training/          candidate list → training parquet (all_contigs.parquet)
 ```
 
@@ -60,9 +60,23 @@ uv run python benchmark/get_query_alignments_minimap.py $WORK/queries.fa $WORK/l
 uv run python benchmark/finalize_query_dataset.py \
     $WORK/queries.fa $WORK/queries_alignment_stats.parquet $ACCS $WORK/bundle \
     --final_query_num=500
+
+# 5. Write one pre-mutated query file per mutation rate (0.00 / 0.05 / 0.10)
+#    with mutation-simulator: SNP rate = rate, insertion and deletion rates =
+#    rate/10 each. The benchmark never mutates on the fly; its --mutation_rate
+#    picks one of these files.
+uv run python benchmark/mutate_queries.py --bundle $WORK/bundle
 ```
 
-`$WORK/bundle/` then contains `queries.parquet`, `queries.fa`, and `accs.txt` (a copy of the true list, with an assertion that the queries only reference accessions in it).
+`$WORK/bundle/` then contains:
+
+- `queries.parquet` — the clean queries with their alignment ground truth; what `print_results.py` and `make_table3.py` read.
+- `queries_mut0.00.parquet`, `queries_mut0.05.parquet`, `queries_mut0.10.parquet` — `queries.parquet` with `query_sequence` replaced by the mutated read and a `mutation_rate` column added. Same rows in the same order, so the benchmark's seeded subsample picks the same queries at every rate. `run_benchmark.py --mutation_rate <rate>` loads `queries_mut<rate>.parquet`.
+- `queries.fa` — the clean queries as fasta (mutation-simulator's input).
+- `mutations/` — mutation-simulator's fasta and VCF per rate. mutation-simulator has no seed flag, so these are the provenance record: rerunning step 5 draws different mutations, and the parquets are what the benchmark reads.
+- `accs.txt` — a copy of the true list, with an assertion that the queries only reference accessions in it.
+
+Pass `--rates=[0.0,0.02]` or `--indel_fraction=0.0` to step 5 to change the rates; any rate the benchmark is run at must have its file in the bundle.
 
 ## Training pipeline
 

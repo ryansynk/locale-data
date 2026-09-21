@@ -81,6 +81,21 @@ uv run python benchmark/mutate_queries.py --bundle $WORK/bundle
 
 Pass `--rates=[0.0,0.02]` or `--indel_fraction=0.0` to step 5 to change the rates; any rate the benchmark is run at must have its file in the bundle.
 
+### SRA-viral (HBV) bundle
+
+`benchmark/build_viral_bundle.py` builds the cross-genotype retrieval bundle: the index set is an accession list (the sra50 distractors) plus the genotype-B runs (`accessions/hbv_genotype_B.txt`), queries are raw reads from the genotype-D runs (`accessions/hbv_genotype_D.txt`), and every query's relevant set is the five genotype-B accessions (Rq = 5) — relevance comes from SRA genotype metadata, not minimap2. Raw-read sampling and mutation are the same scripts as above; there is no alignment step.
+
+```bash
+uv run python benchmark/build_viral_bundle.py \
+    --index_accs accessions/sra50.txt \
+    --relevant_accs accessions/hbv_genotype_B.txt \
+    --query_accs accessions/hbv_genotype_D.txt \
+    --work_dir constructed/sra55viral/work --output_path constructed/sra55viral/bundle \
+    --seed=55
+```
+
+The bundle has the standard layout and schema (`identity`, `ratio`, `contig_len`, `aln_interval_contig` and `strand` are null; `contig_id` holds the relevant accession), so `run_benchmark.py` runs on it unchanged. `accessions/sra55viral.txt` is its frozen index list (sra50 + genotype B).
+
 ## Training pipeline
 
 The locale trainer (`data_type: contig`) consumes one parquet per split with a `sequence` column; cropping, mutation, and length filtering all happen at train time in the Batcher/Augmenter. Building a dataset is therefore just: download contigs, chunk, shuffle, write parquet.

@@ -2,7 +2,8 @@
 
 Every file under the bundle directory is uploaded at the same relative path
 (accs.txt, queries.parquet, queries_mut<rate>.parquet, queries.fa, mutations/,
-...). The dataset card is a separate tracked file (cards/<set>.md) uploaded
+...). logan_accessions/ is skipped unless --include_contigs=true, for bundles
+whose contigs are themselves the dataset (a subsampled set). The dataset card is a separate tracked file (cards/<set>.md) uploaded
 as README.md. All files go in one commit, so the repo never shows a partial
 bundle.
 
@@ -26,6 +27,7 @@ def main(
     private: bool = False,
     commit_message: str | None = None,
     dry_run: bool = False,
+    include_contigs: bool = False,
 ):
     """
     Args:
@@ -36,6 +38,7 @@ def main(
         private: create the repo private (ignored if it already exists).
         commit_message: defaults to "Upload <bundle name> bundle".
         dry_run: print the file list and exit without uploading.
+        include_contigs: also upload logan_accessions/ (real files only).
     """
     bundle = Path(bundle).resolve()
     # logan_accessions/ is a tree of symlinks into the contig download that the
@@ -45,14 +48,16 @@ def main(
         for p in bundle.rglob("*")
         if p.is_file()
         and not p.is_symlink()
-        and "logan_accessions" not in p.relative_to(bundle).parts
+        and (include_contigs or "logan_accessions" not in p.relative_to(bundle).parts)
     )
     if (bundle / "README.md").exists():
         raise SystemExit(
             f"{bundle} contains a README.md; the card comes from --card instead"
         )
     ops = [
-        CommitOperationAdd(path_in_repo=str(p.relative_to(bundle)), path_or_fileobj=str(p))
+        CommitOperationAdd(
+            path_in_repo=str(p.relative_to(bundle)), path_or_fileobj=str(p)
+        )
         for p in files
     ]
     ops.append(CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=str(card)))

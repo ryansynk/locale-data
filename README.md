@@ -7,6 +7,7 @@ dataset_queries/   SQL against SRA metadata (BigQuery) + subsample script → ca
 accessions/        frozen accession lists (the exact lists behind the published HF datasets)
 benchmark/         candidate list → benchmark bundle (queries.parquet, queries_mut<rate>.parquet, queries.fa, accs.txt)
 training/          candidate list → training parquet (all_contigs.parquet)
+reference/         NCBI reference genomes → cropped training parquet (reference_genome_dataset.parquet)
 constructed/       work dirs and bundles, `constructed/<set>/{work,bundle}` (gitignored)
 ```
 
@@ -45,7 +46,9 @@ ACCS=accessions/<set>.txt
 WORK=constructed/<set>/work
 
 # 1. Download logan contigs. --strict: the list was checked at draw time,
-#    so a missing accession is a real error.
+#    so a missing accession is a real error. --decompress=false stops after
+#    the download (leaves .fa.zst in place); a later default run decompresses
+#    those without re-downloading.
 uv run python benchmark/download_logan_contigs.py $ACCS $WORK/logan_contigs --strict=true
 
 # 2. Stream the first N raw reads per accession from SRA (no full download)
@@ -125,3 +128,48 @@ val_dataset_path: $WORK/val/all_contigs.parquet
 ```
 
 `max_contig_len` (default 1024) should match `augment_config.max_seq_len`, and `min_contig_len` (default 200) must be >= `augment_config.min_seq_len` (150) or the Batcher will just refilter at load.
+
+## Reference-genome training set
+
+The reference-trained checkpoints (8vqiabk9, pc6t1x8j, l6e9itq9, ...) were trained on
+`reference_genome_dataset.parquet`: seven RefSeq genomes cut into non-overlapping 2048 bp
+crops (6.77M rows; columns `sequence / name / accession / organism / crop_start / crop_end`).
+The trainer reads it as an ordinary `data_type: contig` parquet (only `sequence` is used);
+`organism` is the SRA organism name so it joins against `accessions/TableS12_SRA_Public_100studies.tsv`.
+`accessions/reference_genomes.txt` is the frozen list of assembly accessions.
+
+```bash
+# 1. Download (NCBI Datasets CLI, e.g. /pscratch/sd/r/rsynk/bin/datasets). The current
+#    package is already at /pscratch/sd/r/rsynk/reference_data/refs/ncbi_dataset/data;
+#    only rerun this if it has been purged. --species_list <taxa.txt> or
+#    --sra_accs <accs.txt> (organisms of those runs, the original recipe) are
+#    alternatives to the frozen accession list.
+uv run python reference/download_references.py constructed/reference/refs.zip \
+    --assembly_accs accessions/reference_genomes.txt \
+    --datasets_exe /pscratch/sd/r/rsynk/bin/datasets --extract_to constructed/reference/refs
+
+# 2. Crop, shuffle (seed 42), write parquet. ~15 Gbp held as python strings: use a CPU
+#    node (reference/make_dataset.sbatch wraps this). Leave genomes out with
+#    --exclude_organisms (SRA names) or --exclude_accessions (GCF_...); a name that
+#    matches nothing is an error.
+uv run python reference/crop_references.py constructed/reference_nohm/reference_genome_dataset.parquet \
+    --data_dir /pscratch/sd/r/rsynk/reference_data/refs/ncbi_dataset/data \
+    --exclude_organisms "[Homo sapiens,Mus musculus]"
+
+# or, on a CPU node:
+NAME=reference_nohm EXCLUDE="[Homo sapiens,Mus musculus]" sbatch reference/make_dataset.sbatch
+
+# Same row count as the original 7-genome parquet (6,768,336) from the 5 remaining
+# genomes: --target_rows picks the largest stride (<2048, so windows overlap) that
+# yields at least that many windows and trims to it exactly after shuffling.
+NAME=reference_nohm EXCLUDE="[Homo sapiens,Mus musculus]" TARGET=6768336 sbatch reference/make_dataset.sbatch
+
+# 3. Per-genome table (LaTeX) and crops per organism
+uv run python reference/dataset_stats.py \
+    --assembly_data_report_path /pscratch/sd/r/rsynk/reference_data/refs/ncbi_dataset/data/assembly_data_report.jsonl \
+    --parquet_path constructed/reference_nohm/reference_genome_dataset.parquet
+```
+
+Then point the training config at it (`data_type: contig`, `dataset_path: <parquet>`;
+keep the usual logan `val_dataset_path`). Row order differs from the original file (the
+genome file order was filesystem-dependent) but the crops are identical.

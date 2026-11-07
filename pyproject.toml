@@ -10,6 +10,7 @@ dependencies = [
     "mutation-simulator>=3.0.2",
     "numpy",
     "polars",
+    "pyfaidx>=0.9.0.4",
     "pysam",
     "tqdm",
     "zstandard",

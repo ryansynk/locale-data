@@ -8,16 +8,21 @@ from jsonargparse import auto_cli
 from tqdm import tqdm
 
 
+def _nonempty(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
+
+
 def download_logan(srr_id: str, topdir: Path) -> bool:
     """Download one accession's contigs. Returns False if it's not in logan.
 
-    An accession whose decompressed contigs.fa is already present is skipped,
-    so reruns (and work dirs seeded with contigs from an earlier build) only
-    fetch what is missing.
+    An accession whose contigs.fa (or still-compressed contigs.fa.zst, from a
+    --decompress=false run) is already present is skipped, so reruns (and work
+    dirs seeded with contigs from an earlier build) only fetch what is missing.
     """
     target_dir = Path(topdir) / srr_id
     fa_path = target_dir / f"{srr_id}.contigs.fa"
-    if fa_path.exists() and fa_path.stat().st_size > 0:
+    zst_path = target_dir / f"{srr_id}.contigs.fa.zst"
+    if _nonempty(fa_path) or _nonempty(zst_path):
         return True
     target_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -73,6 +78,7 @@ def main(
     output_dir: str,
     num_download_procs: int = 4,
     strict: bool = False,
+    decompress: bool = True,
 ):
     """Download logan contig sets for a candidate list of accessions.
 
@@ -82,7 +88,9 @@ def main(
     non-empty <accession>.contigs.fa) and writes the true accession set to
     output_dir/downloaded_accs.txt — downstream steps should consume that file,
     not the candidate list. Pass --strict=true to instead error out when any
-    requested accession is unavailable.
+    requested accession is unavailable. Pass --decompress=false to stop after
+    the download, leaving <accession>.contigs.fa.zst in place; a later run with
+    the default decompresses those without re-downloading them.
     """
     accessions_list: Path = Path(accessions_list).resolve()
     output_dir: Path = Path(output_dir).resolve()
@@ -107,22 +115,27 @@ def main(
             if not future.result():
                 missing.append(futures[future])
 
-    logan_paths = list(output_dir.rglob("*.fa.zst"))
-    with ProcessPoolExecutor() as decompress_executor:
-        futures = [
-            decompress_executor.submit(decompress_and_cleanup, logan_path)
-            for logan_path in logan_paths
-        ]
-        for f in tqdm(
-            as_completed(futures), desc="Decompressing files...", total=len(futures)
-        ):
-            f.result()
+    if decompress:
+        logan_paths = list(output_dir.rglob("*.fa.zst"))
+        with ProcessPoolExecutor() as decompress_executor:
+            futures = [
+                decompress_executor.submit(decompress_and_cleanup, logan_path)
+                for logan_path in logan_paths
+            ]
+            for f in tqdm(
+                as_completed(futures),
+                desc="Decompressing files...",
+                total=len(futures),
+            ):
+                f.result()
 
     # Certify: every non-missing accession must have a non-empty contigs.fa
+    # (or, when not decompressing, a non-empty contigs.fa.zst)
     downloaded = []
     for srr_id in accs:
         fa_path = output_dir / srr_id / f"{srr_id}.contigs.fa"
-        if fa_path.exists() and fa_path.stat().st_size > 0:
+        zst_path = fa_path.with_name(fa_path.name + ".zst")
+        if _nonempty(fa_path) or (not decompress and _nonempty(zst_path)):
             downloaded.append(srr_id)
         elif srr_id not in missing:
             missing.append(srr_id)

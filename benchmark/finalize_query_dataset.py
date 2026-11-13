@@ -75,6 +75,9 @@ def main(
     max_match_percent: float = 0.2,
     final_query_num: int = 500,
     seed: int = 0,
+    require_source_hit: bool = True,
+    identity_denominator: Literal["read_length", "aligned_span"] = "read_length",
+    min_aligned_bp: int = 0,
 ):
     """Filter query alignments into a final benchmark dataset bundle.
 
@@ -83,9 +86,11 @@ def main(
     accs.txt — the exact layout the benchmark consumes.
 
     Alignments with identity (exact matches / read length) <= identity_filter
-    are dropped first. Then, per query, in this order:
+    are dropped first, as are alignments spanning fewer than min_aligned_bp
+    contig bases. Then, per query, in this order:
       1. drop it if no surviving alignment is to the accession it was sampled
-         from (its source must be in its relevant set);
+         from (its source must be in its relevant set); skipped when
+         require_source_hit is false;
       2. drop it if it aligns to more than ceil(max_match_percent * number of
          indexed accessions) accessions;
       3. drop it if it overlaps another query (filter_mode, see
@@ -95,6 +100,20 @@ def main(
 
     The stored query is the raw read; alignment ran on both strands and the
     `strand` column is the strand of the best hit to the source accession.
+
+    Pass --require_source_hit=false when the query runs are not indexed (the
+    cross-genotype viral bundle): step 1 is skipped, and `strand` is instead
+    the strand of the highest-identity surviving alignment (the first one in
+    accession, contig, start order on ties).
+
+    Pass --identity_denominator=aligned_span when the indexed assemblies are
+    fragmented into contigs shorter than the reads (amplicon runs): identity
+    is then exact matches / aligned contig span, so a read that matches a
+    short contig end to end is not rejected for the bases hanging off it.
+    Dividing by read length makes identity the product of alignment identity
+    and read coverage, which no contig shorter than 0.9 of the read can pass.
+    Set min_aligned_bp with it, or a perfect match of a few bases counts.
+    The stored `identity` column is whichever definition was used.
     """
     minimap_stats: Path = Path(minimap_stats)
     queries_fa: Path = Path(queries_fa)
@@ -137,10 +156,23 @@ def main(
         pl.scan_parquet(minimap_stats)
         .join(read_info, on="read_id")
         .with_columns(
-            (pl.col("matches") / pl.col("read_length")).alias("identity"),
+            (
+                pl.col("aln_end_index_contig") - pl.col("aln_start_index_contig")
+            ).alias("aligned_span"),
+        )
+        .with_columns(
+            (
+                pl.col("matches")
+                / pl.col(
+                    "read_length"
+                    if identity_denominator == "read_length"
+                    else "aligned_span"
+                )
+            ).alias("identity"),
             (pl.col("target_len") / pl.col("read_length")).alias("ratio"),
         )
         .filter(pl.col("identity") > identity_filter)
+        .filter(pl.col("aligned_span") >= min_aligned_bp)
         .sort("read_id", "accession", "contig_id", "aln_start_index_contig")
         .with_columns(
             pl.struct("aln_start_index_contig", "aln_end_index_contig").alias(
@@ -156,7 +188,11 @@ def main(
                 "ratio",
                 "target_len",
                 "aln_interval_contig",
-                pl.col("strand").filter(is_source).first().alias("strand"),
+                (
+                    pl.col("strand").filter(is_source).first()
+                    if require_source_hit
+                    else pl.col("strand").get(pl.col("identity").arg_max())
+                ).alias("strand"),
             ]
         )
         .rename({"accession": "contig_accession", "target_len": "contig_len"})
@@ -166,9 +202,10 @@ def main(
     queries_df = queries_df.rename({"read_id": "query_id"})
 
     # 1. The source accession must be in the relevant set
-    queries_df = queries_df.filter(
-        pl.col("contig_accession").list.contains(pl.col("accession"))
-    )
+    if require_source_hit:
+        queries_df = queries_df.filter(
+            pl.col("contig_accession").list.contains(pl.col("accession"))
+        )
     n_with_source = len(queries_df)
     # 2. Max-match
     max_matches = math.ceil(num_indexed_accessions * max_match_percent)
@@ -194,9 +231,9 @@ def main(
 
     # Every accession the final queries reference must come from the indexed set
     acc_set = set(accessions)
-    referenced_accs = set(queries_df["accession"].to_list()) | set(
-        queries_df["contig_accession"].explode().to_list()
-    )
+    referenced_accs = set(queries_df["contig_accession"].explode().to_list())
+    if require_source_hit:
+        referenced_accs |= set(queries_df["accession"].to_list())
     assert referenced_accs <= acc_set, (
         f"Queries reference accessions not in {accessions_file}: "
         f"{sorted(referenced_accs - acc_set)[:5]}"
@@ -210,7 +247,8 @@ def main(
     n_minus = (queries_df["strand"] == "-").sum()
     print(
         f"Wrote {len(queries_df)} queries to {output_path}: {initial} initial, "
-        f"-{initial - n_with_source} no source hit, "
+        f"-{initial - n_with_source} "
+        f"{'no source hit' if require_source_hit else 'no hit above identity'}, "
         f"-{n_with_source - n_within_max} max-match (>{max_matches}), "
         f"-{n_within_max - eligible} overlap, {eligible} eligible; "
         f"{n_minus}/{len(queries_df)} on the - strand"
